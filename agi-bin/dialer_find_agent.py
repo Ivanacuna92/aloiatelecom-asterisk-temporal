@@ -1,172 +1,106 @@
 #!/usr/bin/env python3
 """
-AGI Script: find_available_agent.py
-Busca un agente disponible para marcador predictivo/progresivo
+AGI: Buscar agente disponible para llamada predictiva
+Consulta al backend API para encontrar un agente disponible
+y devuelve la extensión para hacer bridge.
+
+Uso en dialplan:
+  AGI(dialer_find_agent.py,${CAMPAIGN_ID},${CALL_ATTEMPT_ID})
+
+Establece:
+  AGENT_EXTENSION = extensión del agente (vacío si no hay)
 """
-
 import sys
-import os
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+import json
+import urllib.request
+import urllib.error
 
-# Configuración de base de datos
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
-DB_USER = os.getenv('DB_USER', 'aloia_user')
-DB_PASS = os.getenv('DB_PASS', 'aloia2025secure')
-DB_NAME = os.getenv('DB_NAME', 'aloia_telecom')
+BACKEND_URL = "http://157.173.199.200:8000/api/v1"
 
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+def agi_send(msg):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+    return sys.stdin.readline().strip()
 
+def agi_set_variable(name, value):
+    agi_send(f"SET VARIABLE {name} {value}")
 
-class AGI:
-    """Clase simple para manejar protocolo AGI"""
-
-    def __init__(self):
-        self.env = {}
-        self._read_environment()
-
-    def _read_environment(self):
-        """Lee variables de entorno de Asterisk"""
-        while True:
-            line = sys.stdin.readline().strip()
-            if not line:
-                break
-            key, value = line.split(':', 1)
-            self.env[key.strip()] = value.strip()
-
-    def get_variable(self, name):
-        """Obtiene una variable de canal"""
-        sys.stdout.write(f'GET VARIABLE {name}\n')
-        sys.stdout.flush()
-        result = sys.stdin.readline().strip()
-        if '200 result=1' in result:
-            value = result.split('(')[1].split(')')[0]
-            return value
-        return ""
-
-    def set_variable(self, name, value):
-        """Establece una variable de canal"""
-        sys.stdout.write(f'SET VARIABLE {name} "{value}"\n')
-        sys.stdout.flush()
-        sys.stdin.readline()
-
-    def verbose(self, message, level=1):
-        """Log verbose en Asterisk"""
-        sys.stdout.write(f'VERBOSE "{message}" {level}\n')
-        sys.stdout.flush()
-        sys.stdin.readline()
-
-
-def find_available_agent(campaign_id, call_attempt_id=None):
-    """
-    Busca un agente disponible para la campaña y lo asigna al call_attempt.
-
-    Usa FOR UPDATE SKIP LOCKED para prevenir race conditions cuando
-    2 llamadas simultáneas buscan agente al mismo tiempo.
-    Ordena por total_calls_handled ASC (round-robin equitativo).
-    También marca AgentSession.status = 'busy' al asignar.
-    """
-    try:
-        engine = create_engine(DATABASE_URL)
-        Session = sessionmaker(bind=engine)
-        session = Session()
-
-        # Buscar agente disponible con skip_locked:
-        # - JOIN con agent_sessions para verificar sesión activa (heartbeat < 60s)
-        # - ORDER BY total_calls_handled ASC para distribución equitativa
-        # - FOR UPDATE SKIP LOCKED para evitar asignaciones duplicadas
-        query = text("""
-            SELECT a.id, a.extension, ags.id as session_id
-            FROM agents a
-            JOIN campaigns c ON c.group_id = a.group_id
-            JOIN agent_sessions ags ON ags.agent_id = a.id
-                AND ags.logged_out_at IS NULL
-                AND ags.last_heartbeat >= (NOW() - INTERVAL '60 seconds')
-                AND ags.status = 'available'
-            WHERE c.id = :campaign_id
-              AND a.is_active = true
-              AND a.status = 'AVAILABLE'::agentstatus
-            ORDER BY ags.total_calls_handled ASC, a.id ASC
-            LIMIT 1
-            FOR UPDATE OF a, ags SKIP LOCKED
-        """)
-
-        result = session.execute(query, {"campaign_id": campaign_id}).fetchone()
-
-        if result:
-            agent_id = result[0]
-            agent_extension = str(result[1])
-            session_id = result[2]
-
-            # Marcar agente como BUSY
-            update_agent = text("""
-                UPDATE agents SET status = 'BUSY'::agentstatus
-                WHERE id = :agent_id
-            """)
-            session.execute(update_agent, {"agent_id": agent_id})
-
-            # Marcar AgentSession como busy
-            update_session = text("""
-                UPDATE agent_sessions
-                SET status = 'busy', active_calls = COALESCE(active_calls, 0) + 1
-                WHERE id = :session_id
-            """)
-            session.execute(update_session, {"session_id": session_id})
-
-            # Asignar agente al call_attempt si se proporciona
-            if call_attempt_id:
-                update_attempt = text("""
-                    UPDATE call_attempts
-                    SET agent_id = :agent_id, answered_at = NOW()
-                    WHERE id = :call_attempt_id
-                """)
-                session.execute(update_attempt, {
-                    "agent_id": agent_id,
-                    "call_attempt_id": call_attempt_id
-                })
-
-            session.commit()
-            session.close()
-            return agent_extension
-
-        session.close()
-        return ""
-
-    except Exception as e:
-        sys.stderr.write(f"Error en find_available_agent: {str(e)}\n")
-        return ""
-
+def agi_verbose(msg, level=1):
+    agi_send(f"VERBOSE \"{msg}\" {level}")
 
 def main():
-    """Función principal del AGI script"""
-    agi = AGI()
+    # Leer headers AGI
+    env = {}
+    while True:
+        line = sys.stdin.readline().strip()
+        if not line:
+            break
+        if ":" in line:
+            key, val = line.split(":", 1)
+            env[key.strip()] = val.strip()
 
-    # Obtener variables de canal
-    campaign_id = agi.get_variable('CAMPAIGN_ID')
-    call_attempt_id = agi.get_variable('CALL_ATTEMPT_ID')
+    # Argumentos
+    args = env.get("agi_arg_1", ""), env.get("agi_arg_2", "")
+    campaign_id = args[0]
+    call_attempt_id = args[1]
 
-    if not campaign_id:
-        agi.verbose("ERROR: CAMPAIGN_ID no proporcionado", 1)
-        agi.set_variable('AGENT_EXTENSION', '')
-        return
+    agi_verbose(f"[FIND_AGENT] Campaign: {campaign_id}, Attempt: {call_attempt_id}")
 
-    agi.verbose(f"Buscando agente para campaña {campaign_id}, attempt {call_attempt_id}", 2)
-
-    # Buscar agente disponible
-    agent_extension = find_available_agent(campaign_id, call_attempt_id)
-
-    if agent_extension:
-        agi.verbose(f"Agente encontrado: {agent_extension}", 2)
-        agi.set_variable('AGENT_EXTENSION', agent_extension)
-    else:
-        agi.verbose("No hay agentes disponibles", 2)
-        agi.set_variable('AGENT_EXTENSION', '')
-
-
-if __name__ == '__main__':
     try:
-        main()
+        # Consultar backend para agente disponible
+        url = f"{BACKEND_URL}/dialer/debug/connected-agents"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Content-Type", "application/json")
+
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+
+        # Buscar agente disponible con extensión
+        agents = data.get("agents_info", [])
+        agent_ext = ""
+
+        for agent in agents:
+            if agent.get("status") == "AVAILABLE" and agent.get("extension"):
+                agent_ext = str(agent["extension"])
+                agent_id = agent.get("id", "")
+                agi_verbose(f"[FIND_AGENT] Found agent {agent_id} ext {agent_ext}")
+
+                # Notificar al backend que asignamos este agente
+                try:
+                    assign_url = f"{BACKEND_URL}/agents/status/"
+                    assign_data = json.dumps({
+                        "status": "ON_CALL",
+                        "agent_id": int(agent_id)
+                    }).encode()
+                    assign_req = urllib.request.Request(assign_url, data=assign_data, method="POST")
+                    assign_req.add_header("Content-Type", "application/json")
+                    urllib.request.urlopen(assign_req, timeout=3)
+                except Exception as e:
+                    agi_verbose(f"[FIND_AGENT] Error setting agent status: {e}")
+
+                # Asignar agent_id al call_attempt para que no se marque como ABANDONED
+                try:
+                    attempt_url = f"{BACKEND_URL}/dialer/attempts/{call_attempt_id}"
+                    attempt_data = json.dumps({
+                        "agent_id": int(agent_id)
+                    }).encode()
+                    attempt_req = urllib.request.Request(attempt_url, data=attempt_data, method="PUT")
+                    attempt_req.add_header("Content-Type", "application/json")
+                    urllib.request.urlopen(attempt_req, timeout=3)
+                    agi_verbose(f"[FIND_AGENT] Assigned agent {agent_id} to attempt {call_attempt_id}")
+                except Exception as e:
+                    agi_verbose(f"[FIND_AGENT] Error assigning agent to attempt: {e}")
+
+                break
+
+        if not agent_ext:
+            agi_verbose("[FIND_AGENT] No available agent found")
+
+        agi_set_variable("AGENT_EXTENSION", agent_ext)
+
     except Exception as e:
-        sys.stderr.write(f"Error fatal en AGI: {str(e)}\n")
-        sys.exit(1)
+        agi_verbose(f"[FIND_AGENT] Error: {str(e)}")
+        agi_set_variable("AGENT_EXTENSION", "")
+
+if __name__ == "__main__":
+    main()
