@@ -1,0 +1,332 @@
+[general]
+static=yes
+writeprotect=no
+clearglobalvars=no
+
+[globals]
+TRUNK_PREFIX=9629452
+BACKEND_URL=http://157.173.199.200:8000/api/v1
+
+; ============================================================
+; LLAMADAS SALIENTES MANUALES (Softphone WebRTC)
+; ============================================================
+[from-internal]
+exten => _X.,1,NoOp(=== LLAMADA SALIENTE a ${EXTEN} ===)
+ same => n,GotoIf($["${EXTEN:0:7}" = "${TRUNK_PREFIX}"]?ya_tiene)
+ same => n,Set(DIAL_NUMBER=${TRUNK_PREFIX}${EXTEN})
+ same => n,Goto(marcar)
+ same => n(ya_tiene),Set(DIAL_NUMBER=${EXTEN})
+ same => n(marcar),NoOp(NUMERO FINAL: ${DIAL_NUMBER})
+ same => n,Dial(PJSIP/${DIAL_NUMBER}@trunk-out,60,tT)
+ same => n,Hangup()
+exten => h,1,NoOp(Llamada saliente finalizada)
+
+; ============================================================
+; LLAMADAS MANUALES VIA AMI ORIGINATE
+; ============================================================
+[aloia-manual-outbound]
+exten => _X.,1,NoOp(=== LLAMADA MANUAL a ${EXTEN} ===)
+ same => n,GotoIf($["${EXTEN:0:7}" = "${TRUNK_PREFIX}"]?ya_tiene)
+ same => n,Set(DIAL_NUMBER=${TRUNK_PREFIX}${EXTEN})
+ same => n,Goto(marcar)
+ same => n(ya_tiene),Set(DIAL_NUMBER=${EXTEN})
+ same => n(marcar),NoOp(NUMERO FINAL: ${DIAL_NUMBER})
+ same => n,Dial(PJSIP/${DIAL_NUMBER}@trunk-out,60,tT)
+ same => n,Hangup()
+exten => h,1,NoOp(Llamada manual finalizada)
+
+; ============================================================
+; MARCADOR PROGRESIVO PRO
+; ============================================================
+; Flujo:
+;   1. Backend llama al AGENTE primero (PJSIP/{ext})
+;   2. Agente contesta -> entra aqui
+;   3. Audio "conectando" + musica de espera
+;   4. Asterisk marca al CLIENTE via trunk-out
+;   5. Cliente contesta -> Bridge inmediato con grabacion
+;   6. Hangup -> AGI notifica resultado al backend
+; ============================================================
+[dialer-progressive]
+exten => s,1,NoOp(=== PROGRESSIVE DIALER ===)
+ same => n,Answer()
+ same => n,Set(CAMPAIGN_ID=${CAMPAIGN_ID})
+ same => n,Set(CALL_ATTEMPT_ID=${CALL_ATTEMPT_ID})
+ same => n,Set(PHONE_NUMBER=${PHONE_NUMBER})
+ same => n,Set(AGENT_EXTENSION=${AGENT_EXTENSION})
+ same => n,Set(CALL_START=${EPOCH})
+
+ ; Audio al agente: "conectando con cliente"
+ same => n,Playback(español/connecting_agent_es)
+
+ ; Prefijo trunk
+ same => n,GotoIf($["${PHONE_NUMBER:0:7}" = "${TRUNK_PREFIX}"]?tiene_prefijo)
+ same => n,Set(DIAL_NUMBER=${TRUNK_PREFIX}${PHONE_NUMBER})
+ same => n,Goto(marcar_cliente)
+ same => n(tiene_prefijo),Set(DIAL_NUMBER=${PHONE_NUMBER})
+
+ ; Iniciar grabacion antes de marcar
+ same => n(marcar_cliente),NoOp(Marcando cliente: ${DIAL_NUMBER})
+ same => n,Set(RECORDING_FILE=progressive-${CALL_ATTEMPT_ID}-${UNIQUEID}.wav)
+ same => n,MixMonitor(/var/spool/asterisk/monitor/recordings/${RECORDING_FILE},b)
+
+ ; Marcar al cliente - agente escucha ring, cliente escucha musica de espera
+ same => n,Dial(PJSIP/${DIAL_NUMBER}@trunk-out,45,tTgm(default))
+
+ ; Resultado del Dial
+ same => n,NoOp(Dial Status: ${DIALSTATUS})
+ same => n,StopMixMonitor()
+ same => n,Set(DIAL_DURATION=$[${EPOCH} - ${CALL_START}])
+ same => n,GotoIf($["${DIALSTATUS}" = "ANSWER"]?completada)
+
+ ; Cliente no contesto
+ same => n,Playback(español/agent_unavailable_es)
+ same => n,Hangup()
+
+ ; Llamada completada
+ same => n(completada),Playback(español/call_transferred_es)
+ same => n,Hangup()
+
+; Hangup handler - notifica al backend el resultado
+exten => h,1,NoOp(Progressive ended: ${CAMPAIGN_ID} | ${CALL_ATTEMPT_ID} | ${DIALSTATUS})
+ same => n,Set(DIAL_DURATION=$[${EPOCH} - ${CALL_START}])
+ same => n,AGI(progressive_hangup.py,${CALL_ATTEMPT_ID},${DIALSTATUS},${DIAL_DURATION},${RECORDING_FILE})
+
+; ============================================================
+; MARCADOR PREDICTIVO
+; ============================================================
+[from-dialer-predictive]
+exten => s,1,NoOp(=== PREDICTIVE DIALER ===)
+ same => n,Set(CAMPAIGN_ID=${CAMPAIGN_ID})
+ same => n,Set(CALL_ATTEMPT_ID=${CALL_ATTEMPT_ID})
+ same => n,Answer()
+ same => n,Wait(0.5)
+
+ same => n,Set(AMD_ENABLED=${AMD_ENABLED:-0})
+ same => n,GotoIf($["${AMD_ENABLED}" = "0"]?skip_amd)
+ same => n,NoOp(AMD ENABLED - Detecting...)
+ same => n,AMD(${AMD_INITIAL_SILENCE:-2500},${AMD_GREETING:-1500},${AMD_AFTER_GREETING_SILENCE:-800},${AMD_TOTAL_TIME:-5000},${AMD_MIN_WORD_LENGTH:-100},${AMD_MAX_WORD_LENGTH:-5000})
+ same => n,Set(AMDSTATUS=${AMDSTATUS})
+ same => n,Set(AMDCAUSE=${AMDCAUSE})
+ same => n,NoOp(AMD Result: ${AMDSTATUS} / ${AMDCAUSE})
+ same => n,AGI(process_amd_result.py,${CALL_ATTEMPT_ID},${AMDSTATUS},${AMDCAUSE})
+ same => n,GotoIf($["${AMDSTATUS}" = "MACHINE"]?amd_machine)
+ same => n,Goto(skip_amd)
+
+ same => n(amd_machine),NoOp(*** MACHINE DETECTED - Hanging up ***)
+ same => n,Hangup()
+
+ same => n(skip_amd),NoOp(Searching for available agent...)
+ same => n,AGI(dialer_find_agent.py,${CAMPAIGN_ID},${CALL_ATTEMPT_ID})
+ same => n,GotoIf($["${AGENT_EXTENSION}" = ""]?no_agent:agent_found)
+
+ same => n(agent_found),NoOp(Agent found: ${AGENT_EXTENSION})
+ same => n,Playback(español/connecting_agent_es)
+ same => n,Set(CDR(userfield)=AGENT:${AGENT_EXTENSION})
+ same => n,Set(CALLERID(num)=${PHONE_NUMBER})
+ same => n,Set(CALLERID(name)=${LEAD_NAME})
+ same => n,Dial(PJSIP/${AGENT_EXTENSION},30,tTg)
+ same => n,NoOp(Dial to agent finished: ${DIALSTATUS})
+ same => n,Hangup()
+
+ same => n(no_agent),NoOp(No agent available - holding)
+ same => n,Playback(español/all_agents_busy_es)
+ same => n,Set(MAX_WAIT=${PREDICTIVE_MAX_WAIT_TIME:-30})
+ same => n,Set(WAIT_START=${EPOCH})
+ same => n,Set(RETRY_COUNT=0)
+
+ same => n(wait_loop),StartMusicOnHold(default)
+ same => n,Wait(5)
+ same => n,StopMusicOnHold()
+ same => n,Set(ELAPSED=$[${EPOCH} - ${WAIT_START}])
+ same => n,GotoIf($[${ELAPSED} >= ${MAX_WAIT}]?timeout)
+ same => n,Set(RETRY_COUNT=$[${RETRY_COUNT} + 1])
+ same => n,AGI(dialer_find_agent.py,${CAMPAIGN_ID},${CALL_ATTEMPT_ID})
+ same => n,GotoIf($["${AGENT_EXTENSION}" != ""]?agent_found)
+ same => n,Goto(wait_loop)
+
+ same => n(timeout),NoOp(*** TIMEOUT - ABANDONED after ${ELAPSED}s ***)
+ same => n,Set(CDR(userfield)=ABANDONED:${ELAPSED}s)
+ same => n,AGI(mark_abandoned.py,${CALL_ATTEMPT_ID},${ELAPSED})
+ same => n,Playback(español/goodbye_es)
+ same => n,Hangup()
+
+exten => h,1,NoOp(Predictive ended: ${CAMPAIGN_ID} | ${CALL_ATTEMPT_ID} | ${DIALSTATUS})
+ same => n,AGI(predictive_hangup.py,${CALL_ATTEMPT_ID},${DIALSTATUS},${AGENT_EXTENSION})
+
+; ============================================================
+; BLASTER - IVR MASIVO CON TRANSFERENCIAS
+; ============================================================
+[blaster-simple]
+exten => s,1,NoOp(=== BLASTER IVR - ${PHONE_NUMBER} ===)
+ same => n,Answer()
+ same => n,Wait(0.5)
+ same => n,Set(CALL_START=${EPOCH})
+ same => n,Set(DTMF_RESULT=)
+
+ same => n,Background(${AUDIO_FILE})
+
+ same => n,WaitExten(5)
+
+ same => n,Set(DURATION=$[${EPOCH} - ${CALL_START}])
+ same => n,AGI(blaster_webhook.py,${CAMPAIGN_NAME},${PHONE_NUMBER},${UNIQUEID},,answered,${DURATION})
+ same => n,Hangup()
+
+exten => 0,1,Set(DTMF_RESULT=0)
+ same => n,Goto(s-dtmf,s,1)
+exten => 1,1,Set(DTMF_RESULT=1)
+ same => n,Goto(s-dtmf,s,1)
+exten => 2,1,Set(DTMF_RESULT=2)
+ same => n,Goto(s-dtmf,s,1)
+exten => 3,1,Set(DTMF_RESULT=3)
+ same => n,Goto(s-dtmf,s,1)
+exten => 4,1,Set(DTMF_RESULT=4)
+ same => n,Goto(s-dtmf,s,1)
+exten => 5,1,Set(DTMF_RESULT=5)
+ same => n,Goto(s-dtmf,s,1)
+exten => 6,1,Set(DTMF_RESULT=6)
+ same => n,Goto(s-dtmf,s,1)
+exten => 7,1,Set(DTMF_RESULT=7)
+ same => n,Goto(s-dtmf,s,1)
+exten => 8,1,Set(DTMF_RESULT=8)
+ same => n,Goto(s-dtmf,s,1)
+exten => 9,1,Set(DTMF_RESULT=9)
+ same => n,Goto(s-dtmf,s,1)
+exten => *,1,Set(DTMF_RESULT=*)
+ same => n,Goto(s-dtmf,s,1)
+exten => #,1,Set(DTMF_RESULT=#)
+ same => n,Goto(s-dtmf,s,1)
+
+exten => h,1,NoOp(Blaster hangup: ${PHONE_NUMBER} queue=${QUEUE_ENTRY_ID})
+ same => n,Set(DURATION=$[${EPOCH} - ${CALL_START}])
+ same => n,GotoIf($["${QUEUE_ENTRY_ID}" = ""]?no_queue)
+ same => n,AGI(blaster_queue_hangup.py,${QUEUE_ENTRY_ID},${DURATION},${RECORDING_FILE})
+ same => n(no_queue),AGI(blaster_webhook.py,${CAMPAIGN_NAME},${PHONE_NUMBER},${UNIQUEID},${DTMF_RESULT},hangup,${DURATION})
+
+; ============================================================
+; PROCESAR DTMF - Consultar backend y ejecutar transferencia
+; ============================================================
+[s-dtmf]
+exten => s,1,NoOp(=== DTMF pressed: ${DTMF_RESULT} ===)
+ same => n,Set(DURATION=$[${EPOCH} - ${CALL_START}])
+
+ same => n,AGI(blaster_get_agent.py,${CAMPAIGN_NAME},${PHONE_NUMBER},${UNIQUEID},${DTMF_RESULT},answered,${DURATION})
+
+ ; === PRIORIDAD 1: Transferencia a numero externo ===
+ same => n,GotoIf($["${TRANSFER_REQUIRED}" = "1"]?transfer_external)
+
+ ; === PRIORIDAD 2: Transferencia a agente interno ===
+ same => n,GotoIf($["${HOLD_REQUIRED}" = "1" & "${AGENT_EXT}" != ""]?transfer_agent)
+
+ ; === PRIORIDAD 3: Hold sin agente (todos ocupados) ===
+ same => n,GotoIf($["${HOLD_REQUIRED}" = "1" & "${AGENT_EXT}" = ""]?no_agent)
+
+ ; === PRIORIDAD 4: Transferencia a departamento ===
+ same => n,GotoIf($["${DEPT_EXT}" != ""]?transfer_department)
+
+ ; === Sin transferencia: gracias y colgar ===
+ same => n,Playback(español/thank_you_es)
+ same => n,Hangup()
+
+ ; --------------------------------------------------
+ ; TRANSFERENCIA A NUMERO EXTERNO
+ ; --------------------------------------------------
+ same => n(transfer_external),NoOp(=== TRANSFER EXTERNAL to ${TRANSFER_NUMBER} ===)
+ same => n,Playback(español/transfer_connecting_es)
+ same => n,StartMusicOnHold(default)
+ same => n,Wait(1)
+ same => n,StopMusicOnHold()
+
+ same => n,Set(CALLERID(num)=${PHONE_NUMBER})
+ same => n,Set(CALLERID(name)=${PHONE_NUMBER})
+ same => n,Set(PJSIP_HEADER(add,P-Asserted-Identity)=<sip:${PHONE_NUMBER}@${SIPDOMAIN}>)
+ same => n,Set(PJSIP_HEADER(add,Remote-Party-ID)=<sip:${PHONE_NUMBER}@${SIPDOMAIN}>)
+
+ same => n,Set(RECORDING_FILE=blaster-transfer-${UNIQUEID}.wav)
+ same => n,MixMonitor(/var/spool/asterisk/monitor/recordings/${RECORDING_FILE},b)
+
+ same => n,GotoIf($["${TRANSFER_NUMBER:0:7}" = "${TRUNK_PREFIX}"]?ext_tiene_prefijo)
+ same => n,Set(PHONE_TO_DIAL=${TRUNK_PREFIX}${TRANSFER_NUMBER})
+ same => n,Goto(ext_marcar)
+ same => n(ext_tiene_prefijo),Set(PHONE_TO_DIAL=${TRANSFER_NUMBER})
+
+ same => n(ext_marcar),NoOp(Dialing external: ${PHONE_TO_DIAL})
+ same => n,Dial(PJSIP/${PHONE_TO_DIAL}@trunk-out,120,tTm(default))
+ same => n,NoOp(External dial result: ${DIALSTATUS})
+ same => n,StopMixMonitor()
+ same => n,GotoIf($["${DIALSTATUS}" = "ANSWER"]?ext_ok)
+ same => n,Playback(español/transfer_failed_es)
+ same => n,Hangup()
+ same => n(ext_ok),Playback(español/call_transferred_es)
+ same => n,Hangup()
+
+ ; --------------------------------------------------
+ ; TRANSFERENCIA A AGENTE INTERNO
+ ; --------------------------------------------------
+ same => n(transfer_agent),NoOp(=== TRANSFER AGENT ext=${AGENT_EXT} queue=${QUEUE_ENTRY_ID} ===)
+ same => n,Playback(español/transfer_connecting_es)
+ same => n,StartMusicOnHold(default)
+ same => n,Wait(1)
+ same => n,StopMusicOnHold()
+
+ same => n,Set(RECORDING_FILE=blaster-${UNIQUEID}.wav)
+ same => n,MixMonitor(/var/spool/asterisk/monitor/recordings/${RECORDING_FILE},b)
+
+ same => n,Set(PJSIP_HEADER(add,Alert-Info)=answer-after=0)
+ same => n,Dial(PJSIP/${AGENT_EXT},30,tTgb(blaster-agent-connect^s^1(${QUEUE_ENTRY_ID})))
+ same => n,NoOp(Agent dial result: ${DIALSTATUS})
+ same => n,StopMixMonitor()
+
+ same => n,GotoIf($["${DIALSTATUS}" = "ANSWER"]?agent_answered)
+ same => n,AGI(blaster_queue_failed.py,${QUEUE_ENTRY_ID},${DIALSTATUS})
+ same => n,Playback(español/agent_unavailable_es)
+ same => n,Hangup()
+
+ same => n(agent_answered),NoOp(Agent connected)
+ same => n,Hangup()
+
+ ; --------------------------------------------------
+ ; SIN AGENTE DISPONIBLE
+ ; --------------------------------------------------
+ same => n(no_agent),NoOp(=== NO AGENT AVAILABLE ===)
+ same => n,Playback(español/all_agents_busy_es)
+ same => n,GotoIf($["${QUEUE_ENTRY_ID}" != ""]?no_agent_notify)
+ same => n,Hangup()
+ same => n(no_agent_notify),AGI(blaster_queue_failed.py,${QUEUE_ENTRY_ID},NO_AGENT)
+ same => n,Hangup()
+
+ ; --------------------------------------------------
+ ; TRANSFERENCIA A DEPARTAMENTO
+ ; --------------------------------------------------
+ same => n(transfer_department),NoOp(=== TRANSFER DEPARTMENT ext=${DEPT_EXT} ===)
+ same => n,Playback(español/transfer_connecting_es)
+ same => n,StartMusicOnHold(default)
+ same => n,Wait(1)
+ same => n,StopMusicOnHold()
+
+ same => n,Set(RECORDING_FILE=blaster-dept-${UNIQUEID}.wav)
+ same => n,MixMonitor(/var/spool/asterisk/monitor/recordings/${RECORDING_FILE},b)
+
+ same => n,Dial(PJSIP/${DEPT_EXT},60,tTg)
+ same => n,NoOp(Department dial result: ${DIALSTATUS})
+ same => n,StopMixMonitor()
+ same => n,GotoIf($["${DIALSTATUS}" = "ANSWER"]?dept_ok)
+ same => n,Playback(español/transfer_failed_es)
+ same => n,Hangup()
+ same => n(dept_ok),Playback(español/call_transferred_es)
+ same => n,Hangup()
+
+; ============================================================
+; SUBROUTINE: Notificar connected cuando el agente contesta
+; ============================================================
+[blaster-agent-connect]
+exten => s,1,NoOp(=== Agent answered - notifying backend ===)
+ same => n,Set(Q_ID=${ARG1})
+ same => n,AGI(blaster_queue_connected.py,${Q_ID})
+ same => n,Return()
+
+
+[from-trunk]
+exten => _X.,1,NoOp(=== LLAMADA ENTRANTE: ${EXTEN} ===)
+ same => n,Answer()
+ same => n,Playback(hello-world)
+ same => n,Hangup()
